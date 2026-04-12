@@ -100,16 +100,18 @@
 
 		.tabs {
 			position: fixed;
-			bottom: 0;
+			top: 0;
 			left: 0;
 			right: 0;
+			bottom: auto;
 			background: rgba(12, 18, 31, .92);
 			backdrop-filter: blur(10px);
-			border-top: 1px solid var(--border);
+			border-top: none;
+			border-bottom: 1px solid var(--border);
 			display: grid;
 			grid-template-columns: repeat(5, 1fr);
 			padding: 8px;
-			z-index: 20;
+			z-index: 50;
 		}
 
 		.tab {
@@ -925,7 +927,15 @@
 			background: linear-gradient(180deg, #0f172a, #101a2e 48%, #0f172a);
 		}
 
+		.app {
+			padding-top: 96px;
+			padding-bottom: 24px;
+		}
+
 		.topbar {
+			position: sticky;
+			top: 76px;
+			z-index: 15;
 			background: rgba(15, 23, 42, 0.9);
 			border-bottom: 1px solid rgba(73, 98, 139, 0.32);
 		}
@@ -972,8 +982,16 @@
 		}
 
 		.tabs {
+			position: fixed;
+			top: 0;
 			background: rgba(15, 23, 42, 0.95);
 			border-color: #324765;
+			left: 0;
+			right: 0;
+			bottom: auto;
+			border-top: none;
+			border-bottom: 1px solid var(--border);
+			z-index: 50;
 		}
 
 		.tab { color: #b3c3de; }
@@ -1494,6 +1512,19 @@
 			border-color: #3d5d8b;
 		}
 
+		.bodyweight-btn {
+			min-width: 54px;
+			padding: 0 10px;
+			font-size: 0.78rem;
+			font-weight: 800;
+		}
+
+		.bodyweight-btn.active {
+			background: #243454;
+			border-color: #6ca7ff;
+			color: #eef4ff;
+		}
+
 		/* --- Spacing rhythm polish (8/12/16/20) --- */
 		:root {
 			--space-1: 8px;
@@ -1585,6 +1616,34 @@
 			.exercise-card,
 			.split-item {
 				padding: var(--space-2);
+			}
+		}
+
+		/* Final nav lock: keep tab bar pinned on top on all devices */
+		.app > .tabs {
+			position: fixed !important;
+			top: 0 !important;
+			left: 0 !important;
+			right: 0 !important;
+			bottom: auto !important;
+			width: 100% !important;
+			margin: 0 !important;
+			z-index: 1000 !important;
+			border-top: none !important;
+			border-bottom: 1px solid var(--border) !important;
+		}
+
+		@supports (top: env(safe-area-inset-top)) {
+			.app > .tabs {
+				top: env(safe-area-inset-top) !important;
+			}
+
+			.app {
+				padding-top: calc(96px + env(safe-area-inset-top));
+			}
+
+			.topbar {
+				top: calc(76px + env(safe-area-inset-top));
 			}
 		}
 
@@ -1920,7 +1979,10 @@
 				return `
 					<div class="set-row mode-normal">
 						<div class="set-index">#${index + 1}</div>
-						<input class="input" type="number" min="0" step="0.5" placeholder="Weight" data-set-input="weight" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.weight)}" />
+						<button class="btn bodyweight-btn ${set.bodyweight ? "active" : ""}" title="Toggle bodyweight" data-toggle-bodyweight="${exerciseId}" data-idx="${index}">${set.bodyweight ? "BW" : "KG"}</button>
+							${set.bodyweight
+								? `<input class="input" type="number" min="0" step="0.1" placeholder="Bodyweight" data-set-input="bodyweightWeight" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.bodyweightWeight)}" />`
+								: `<input class="input" type="number" min="0" step="0.5" placeholder="Weight" data-set-input="weight" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.weight)}" />`}
 						<input class="input" type="number" min="0" step="1" placeholder="Reps" data-set-input="reps" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.reps)}" />
 						<button class="icon-btn" title="Remove set" data-remove-set="${exerciseId}" data-idx="${index}">×</button>
 					</div>
@@ -2253,6 +2315,22 @@
 						ex.sets[idx][field] = inp.value;
 						ex.updatedAt = new Date().toISOString();
 						autosave();
+					};
+				});
+
+				root.querySelectorAll("[data-toggle-bodyweight]").forEach((btn) => {
+					btn.onclick = () => {
+						const exId = btn.dataset.toggleBodyweight;
+						const idx = Number(btn.dataset.idx);
+						const ex = workout.exercises.find((x) => x.exerciseId === exId);
+						if (!ex || !ex.sets || !ex.sets[idx]) return;
+						ex.sets[idx].bodyweight = !ex.sets[idx].bodyweight;
+						if (ex.sets[idx].bodyweight) {
+							ex.sets[idx].weight = "";
+								ex.sets[idx].bodyweightWeight = ex.sets[idx].bodyweightWeight || "";
+						}
+						autosave();
+						render();
 					};
 				});
 
@@ -3193,7 +3271,7 @@
 			function makeEmptyStrengthSet(mode) {
 				if (mode === "drop") return { topWeight: "", topReps: "", dropWeight: "", dropReps: "" };
 				if (mode === "superset") return { aWeight: "", aReps: "", bWeight: "", bReps: "" };
-				return { weight: "", reps: "" };
+				return { weight: "", reps: "", bodyweight: false };
 			}
 			function normalizeStrengthSetByMode(set, mode) {
 				const s = set || {};
@@ -3215,7 +3293,9 @@
 				}
 				return {
 					weight: normalizeNum(s.weight ?? s.topWeight ?? s.aWeight),
-					reps: normalizeNum(s.reps ?? s.topReps ?? s.aReps)
+					reps: normalizeNum(s.reps ?? s.topReps ?? s.aReps),
+					bodyweight: !!s.bodyweight,
+					bodyweightWeight: normalizeNum(s.bodyweightWeight)
 				};
 			}
 			function hasAnyLoggedStrengthValue(set, mode) {
@@ -3225,10 +3305,14 @@
 				if (mode === "superset") {
 					return normalizeNum(set.aWeight) !== "" || normalizeNum(set.aReps) !== "" || normalizeNum(set.bWeight) !== "" || normalizeNum(set.bReps) !== "";
 				}
+				if (set.bodyweight) return normalizeNum(set.reps) !== "" || normalizeNum(set.bodyweightWeight) !== "";
 				return normalizeNum(set.weight) !== "" || normalizeNum(set.reps) !== "";
 			}
 			function getStrengthPairsFromSet(set) {
 				if (!set || typeof set !== "object") return [];
+				if (set.bodyweight) {
+					return normalizeNum(set.reps) !== "" ? [{ weight: set.bodyweightWeight ?? 0, reps: set.reps }] : [];
+				}
 				if ("topWeight" in set || "dropWeight" in set) {
 					return [
 						{ weight: set.topWeight, reps: set.topReps },
@@ -3256,6 +3340,9 @@
 					const a = `${safeNum(set.aWeight)}x${safeNum(set.aReps)}`;
 					const b = `${safeNum(set.bWeight)}x${safeNum(set.bReps)}`;
 					return `A ${a}${b !== "x" ? ` + B ${b}` : ""}`;
+				}
+				if (set.bodyweight) {
+					return `BW ${safeNum(set.bodyweightWeight)}x${safeNum(set.reps)}`;
 				}
 				return `${safeNum(set.weight)}x${safeNum(set.reps)}`;
 			}
