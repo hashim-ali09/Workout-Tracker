@@ -21,24 +21,37 @@ This app is a single-file HTML application built with HTML, CSS, and JavaScript.
 - Temporary weekly split shifts for busy days
 - Normal, drop set, and superset logging modes
 - Cardio set logging
+- One-tap "Same as Prev" set cloning per exercise
+- Bodyweight mode with optional added load (`BW` or `BW+addedWeight`)
 - Calendar view with saved-workout month list
 - Dedicated History tab for full exercise session history
-- Exercise recommendation chips when building splits
+- Canonical Exercise Library page (single source of truth for exercise names/types)
+- Split exercise picker with single search bar + live dropdown suggestions
+- Split exercise names/types are locked in Splits (edits are done from Exercise Library only)
 - Holiday/rest-day support
 - Local backup and restore through JSON export/import
+- Mobile-focused responsive layout and touch-friendly controls
 
 ## How To Use
 
 1. Open `workout_tracker.html` in a modern browser.
-2. Go to the Splits tab to create and organize your splits.
-3. Assign a split to each weekday in the weekly planner.
-4. Open Today to select a date, choose a split, and log your workout.
-5. Pick a logging mode for each exercise:
+2. Go to the Exercises tab and add your canonical exercise list first.
+3. Go to Splits to create/organize splits and add exercises using the single search bar picker.
+4. Assign a split to each weekday in the weekly planner.
+5. Open Today to select a date, choose a split, and log your workout.
+6. Pick a logging mode for each exercise:
    - Normal: weight and reps
    - Drop Set: top set and drop set fields
    - Superset: A and B exercise fields
-6. Press Save Workout to mark the day as saved (partial completion is allowed).
-7. Use History to inspect complete logs for any exercise.
+7. Use `Same as Prev` to quickly duplicate the last set for an exercise.
+8. Press Save Workout to mark the day as saved (partial completion is allowed).
+9. Use History to inspect complete logs for any exercise.
+
+## Notes On Exercise Data Consistency
+
+- Exercise names/types are maintained in the Exercises tab.
+- Editing an exercise in Exercises updates every split and workout record that references that exercise ID.
+- Splits only reference library exercises, which prevents drift from typo/case variations.
 
 ## Data Storage
 
@@ -51,6 +64,7 @@ Storage keys used:
 
 Stored data includes:
 
+- Exercise library
 - Splits and exercises
 - Weekly schedule
 - Temporary weekly overrides
@@ -74,4 +88,3 @@ Use the Data tab to export or import a JSON backup.
 ## License
 
 Free to use, modify, and share.
-
