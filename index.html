@@ -18,7 +18,7 @@
 			--danger: #fb7185;
 			--success: #4ade80;
 			--warning: #fbbf24;
-			--border: #22314c;
+				grid-template-columns: repeat(6, 1fr);
 			--shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 			--radius: 18px;
 			--tap: 46px;
@@ -341,6 +341,48 @@
 			padding: 10px;
 			margin-top: 10px;
 		}
+
+			.combo-wrap {
+				position: relative;
+				flex: 1 1 260px;
+			}
+
+			.combo-menu {
+				position: absolute;
+				top: calc(100% + 4px);
+				left: 0;
+				right: 0;
+				max-height: 220px;
+				overflow: auto;
+				z-index: 12;
+				border: 1px solid var(--border);
+				border-radius: 10px;
+				background: #102037;
+				box-shadow: 0 8px 18px rgba(2, 6, 23, 0.35);
+			}
+
+			.combo-option {
+				width: 100%;
+				text-align: left;
+				border: none;
+				background: transparent;
+				color: var(--text);
+				padding: 9px 10px;
+				cursor: pointer;
+				font: inherit;
+			}
+
+			.combo-option:hover,
+			.combo-option:focus-visible {
+				background: #1a2f4d;
+				outline: none;
+			}
+
+			.combo-empty {
+				padding: 9px 10px;
+				color: var(--muted);
+				font-size: 0.84rem;
+			}
 
 		.split-ex {
 			display: grid;
@@ -1789,6 +1831,9 @@
 				selectedDate: todayISO(),
 				calendarCursor: monthStart(todayISO()),
 				selectedExerciseHistory: null,
+				selectedLibraryExercise: null,
+				librarySearches: {},
+				librarySelections: {},
 				data: loadData()
 			};
 
@@ -1839,6 +1884,7 @@
 					version: 1,
 					createdAt: new Date().toISOString(),
 					settings: { showMissedDays: true, plateauSessions: 3, holidays: [], weekSchedule, weekOverrides: {} },
+					exerciseLibrary: [],
 					splits: [push, pull, legs, cardio],
 					workouts: {}
 				};
@@ -1862,6 +1908,7 @@
 				if (!Array.isArray(data.settings.holidays)) data.settings.holidays = [];
 				if (!Array.isArray(data.settings.weekSchedule)) data.settings.weekSchedule = ["", "", "", "", "", "", ""];
 				if (!data.settings.weekOverrides || typeof data.settings.weekOverrides !== "object" || Array.isArray(data.settings.weekOverrides)) data.settings.weekOverrides = {};
+				if (!Array.isArray(data.exerciseLibrary)) data.exerciseLibrary = [];
 				while (data.settings.weekSchedule.length < 7) data.settings.weekSchedule.push("");
 				if (data.settings.weekSchedule.length > 7) data.settings.weekSchedule = data.settings.weekSchedule.slice(0, 7);
 				data.settings.weekSchedule = data.settings.weekSchedule.map((id) => (typeof id === "string" ? id : ""));
@@ -1870,14 +1917,57 @@
 					.map((h) => ({ date: h.date, name: String(h.name || "Holiday") }));
 				if (!Array.isArray(data.splits)) data.splits = [];
 				if (!data.workouts || typeof data.workouts !== "object") data.workouts = {};
+
+				const libraryMap = new Map();
+				const upsertLibraryEntry = (entry) => {
+					if (!entry) return null;
+					const name = String(entry.name || "").trim();
+					if (!name) return null;
+					const type = normalizeExerciseType(entry.type);
+					const key = exerciseKey(name, type);
+					const current = libraryMap.get(key) || {
+						id: typeof entry.id === "string" && entry.id ? entry.id : uid("ex"),
+						name,
+						type,
+						createdAt: typeof entry.createdAt === "string" ? entry.createdAt : new Date().toISOString(),
+						updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : new Date().toISOString()
+					};
+					current.name = name;
+					current.type = type;
+					current.updatedAt = new Date().toISOString();
+					libraryMap.set(key, current);
+					return current;
+				};
+
+				(data.exerciseLibrary || []).forEach((entry) => upsertLibraryEntry(entry));
 				data.splits.forEach((s) => {
 					if (!s.id) s.id = uid("sp");
 					if (!Array.isArray(s.exercises)) s.exercises = [];
 					s.exercises.forEach((e) => {
 						if (!e.id) e.id = uid("ex");
 						if (!EXERCISE_TYPES.includes(e.type)) e.type = "strength";
+						const libraryEntry = upsertLibraryEntry({ id: e.id, name: e.name, type: e.type });
+						if (libraryEntry) {
+							e.id = libraryEntry.id;
+							e.name = libraryEntry.name;
+							e.type = libraryEntry.type;
+						}
 					});
 				});
+				Object.values(data.workouts).forEach((w) => {
+					if (!Array.isArray(w.exercises)) return;
+					w.exercises.forEach((e) => {
+						if (!e.exerciseId) e.exerciseId = uid("ex");
+						if (!EXERCISE_TYPES.includes(e.type)) e.type = "strength";
+						const libraryEntry = upsertLibraryEntry({ id: e.exerciseId, name: e.name, type: e.type });
+						if (libraryEntry) {
+							e.exerciseId = libraryEntry.id;
+							e.name = libraryEntry.name;
+							e.type = libraryEntry.type;
+						}
+					});
+				});
+				data.exerciseLibrary = Array.from(libraryMap.values()).sort((a, b) => a.name.localeCompare(b.name));
 				const validSplitIds = new Set(data.splits.map((s) => s.id));
 				data.settings.weekSchedule = data.settings.weekSchedule.map((id) => (validSplitIds.has(id) ? id : ""));
 				Object.entries(data.settings.weekOverrides).forEach(([weekStart, row]) => {
@@ -1927,29 +2017,149 @@
 
 			function getExerciseRecommendationsForSplit(splitId) {
 				const split = getSplitById(splitId);
-				const excluded = new Set((split && Array.isArray(split.exercises) ? split.exercises : []).map((ex) => exerciseKey(ex.name, ex.type)));
-				const catalog = new Map();
+				const excluded = new Set((split && Array.isArray(split.exercises) ? split.exercises : []).map((ex) => ex.id));
+				return getExerciseCatalog().filter((entry) => !excluded.has(entry.id));
+			}
 
-				const add = (name, type, lastUsed) => {
-					const key = exerciseKey(name, type);
-					if (!key || excluded.has(key)) return;
-					const current = catalog.get(key) || { name: String(name || "").trim(), type: normalizeExerciseType(type), count: 0, lastUsed: "" };
-					current.count += 1;
-					if (lastUsed && lastUsed > current.lastUsed) current.lastUsed = lastUsed;
-					catalog.set(key, current);
+			function getExerciseCatalog() {
+				const usage = getExerciseUsageMap();
+				return (state.data.exerciseLibrary || [])
+					.map((entry) => {
+						const stats = usage.get(entry.id) || { splits: 0, workouts: 0, total: 0 };
+						return {
+							id: entry.id,
+							key: exerciseKey(entry.name, entry.type),
+							name: entry.name,
+							type: normalizeExerciseType(entry.type),
+							count: stats.total,
+							splits: stats.splits,
+							workouts: stats.workouts,
+							contexts: listLibraryUsageSources(entry.id)
+						};
+					})
+					.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+			}
+
+			function getFilteredLibraryExercises(query, splitId) {
+				const excluded = new Set((getSplitById(splitId)?.exercises || []).map((ex) => ex.id));
+				const normalizedQuery = normalizeExerciseName(query);
+				const catalog = getExerciseCatalog().filter((entry) => !excluded.has(entry.id));
+				if (!normalizedQuery) return catalog;
+
+				return catalog
+					.map((entry) => {
+						const name = normalizeExerciseName(entry.name);
+						const type = normalizeExerciseName(entry.type);
+						const context = normalizeExerciseName((entry.contexts || []).join(" "));
+						let score = 0;
+						if (name === normalizedQuery) score = 100;
+						else if (name.startsWith(normalizedQuery)) score = 90;
+						else if (name.includes(normalizedQuery)) score = 80;
+						else if (context.includes(normalizedQuery)) score = 60;
+						else if (type.includes(normalizedQuery)) score = 50;
+						return { entry, score };
+					})
+					.filter((item) => item.score > 0)
+					.sort((a, b) => b.score - a.score || b.entry.count - a.entry.count || a.entry.name.localeCompare(b.entry.name))
+					.map((item) => item.entry);
+			}
+
+			function formatLibraryOptionLabel(exercise) {
+				if (!exercise) return "";
+				return `${exercise.name} (${capitalizeWord(exercise.type)})`;
+			}
+
+			function renderSplitLibrarySuggestions(splitId, query) {
+				const results = getFilteredLibraryExercises(query, splitId).slice(0, 14);
+				if (!results.length) {
+					return `<div class="combo-empty">${query ? "No matching exercises" : "No library exercises yet"}</div>`;
+				}
+				return results
+					.map((ex) => `<button class="combo-option" type="button" data-library-pick="${splitId}" data-ex-id="${ex.id}">${escapeHtml(formatLibraryOptionLabel(ex))}${ex.count > 0 ? ` • ${ex.count} uses` : ""}</button>`)
+					.join("");
+			}
+
+			function getExerciseUsageMap() {
+				const usage = new Map();
+				const bump = (id, kind) => {
+					if (!id) return;
+					const current = usage.get(id) || { splits: 0, workouts: 0, total: 0 };
+					current[kind] += 1;
+					current.total += 1;
+					usage.set(id, current);
 				};
 
-				(state.data.splits || []).forEach((s) => {
-					(s.exercises || []).forEach((ex) => add(ex.name, ex.type, s.updatedAt || s.createdAt || ""));
+				(state.data.splits || []).forEach((split) => {
+					(split.exercises || []).forEach((ex) => bump(ex.id, "splits"));
 				});
 
-				Object.values(state.data.workouts || {}).forEach((w) => {
-					(w.exercises || []).forEach((ex) => add(ex.name, ex.type, w.date || w.updatedAt || ""));
+				Object.values(state.data.workouts || {}).forEach((workout) => {
+					(workout.exercises || []).forEach((ex) => bump(ex.exerciseId, "workouts"));
 				});
 
-				return Array.from(catalog.values())
-					.sort((a, b) => b.count - a.count || b.lastUsed.localeCompare(a.lastUsed) || a.name.localeCompare(b.name))
-					.slice(0, 8);
+				return usage;
+			}
+
+			function listLibraryUsageSources(exerciseId) {
+				const sources = new Set();
+				(state.data.splits || []).forEach((split) => {
+					if ((split.exercises || []).some((ex) => ex.id === exerciseId)) sources.add(split.name || "Split");
+				});
+				Object.values(state.data.workouts || {}).forEach((workout) => {
+					if ((workout.exercises || []).some((ex) => ex.exerciseId === exerciseId)) sources.add(workout.splitName || workout.date || "Workout");
+				});
+				return Array.from(sources);
+			}
+
+			function findExerciseMatchInfo(name, type) {
+				const trimmed = String(name || "").trim();
+				const normalized = normalizeExerciseName(trimmed);
+				const key = exerciseKey(trimmed, type);
+				const catalog = getExerciseCatalog();
+				const exact = catalog.find((entry) => entry.key === key) || null;
+				const close = catalog
+					.filter((entry) => entry.key !== key)
+					.map((entry) => {
+						const score = nameSimilarity(normalized, normalizeExerciseName(entry.name));
+						return { entry, score };
+					})
+					.filter((item) => item.score >= 0.75)
+					.sort((a, b) => b.score - a.score || b.entry.count - a.entry.count || b.entry.lastUsed.localeCompare(a.entry.lastUsed) || a.entry.name.localeCompare(b.entry.name))
+					.slice(0, 4)
+					.map((item) => item.entry);
+
+				return { exact, close };
+			}
+
+			function nameSimilarity(a, b) {
+				const left = String(a || "");
+				const right = String(b || "");
+				if (!left && !right) return 1;
+				if (!left || !right) return 0;
+				const distance = levenshteinDistance(left, right);
+				return 1 - distance / Math.max(left.length, right.length, 1);
+			}
+
+			function levenshteinDistance(a, b) {
+				const left = String(a || "");
+				const right = String(b || "");
+				const rows = left.length + 1;
+				const cols = right.length + 1;
+				const matrix = Array.from({ length: rows }, (_, i) => [i]);
+
+				for (let j = 1; j < cols; j++) matrix[0][j] = j;
+				for (let i = 1; i < rows; i++) {
+					for (let j = 1; j < cols; j++) {
+						const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+						matrix[i][j] = Math.min(
+							matrix[i - 1][j] + 1,
+							matrix[i][j - 1] + 1,
+							matrix[i - 1][j - 1] + cost
+						);
+					}
+				}
+
+				return matrix[left.length][right.length];
 			}
 
 			function getSharedExerciseId(name, type) {
@@ -1993,6 +2203,7 @@
 
 					<section class="screen ${state.view === "today" ? "active" : ""}" id="screen-today">${renderToday()}</section>
 					<section class="screen ${state.view === "splits" ? "active" : ""}" id="screen-splits">${renderSplits()}</section>
+					<section class="screen ${state.view === "exercises" ? "active" : ""}" id="screen-exercises">${renderExercises()}</section>
 					<section class="screen ${state.view === "calendar" ? "active" : ""}" id="screen-calendar">${renderCalendar()}</section>
 					<section class="screen ${state.view === "history" ? "active" : ""}" id="screen-history">${renderHistory()}</section>
 					<section class="screen ${state.view === "settings" ? "active" : ""}" id="screen-settings">${renderSettings()}</section>
@@ -2005,6 +2216,7 @@
 				const tabs = [
 					["today", "Today"],
 					["splits", "Splits"],
+					["exercises", "Exercises"],
 					["calendar", "Calendar"],
 					["history", "History"],
 					["settings", "Data"]
@@ -2137,8 +2349,6 @@
 					const lastWeekText = !lastWeek
 						? "No exact record from last week"
 						: `Last week: ${(lastWeek.sets || []).map((s, i) => `S${i + 1} ${formatSetForDisplay(s, lastWeek.type, lastWeek.intensityMode || mode)}`).join(" • ")}`;
-					const cmp = compareWithLastSession(ex.exerciseId, state.selectedDate, ex.sets || []);
-					const plateau = getPlateauInsight(ex.exerciseId);
 					const cardioSets = ex.type === "cardio"
 						? ((ex.sets && ex.sets.length ? ex.sets : [{ durationSec: 0, distanceKm: "" }]))
 						: [];
@@ -2156,9 +2366,9 @@
 							<div class="exercise-header">
 								<button class="exercise-name" data-history-exercise="${ex.exerciseId}">${idx + 1}. ${escapeHtml(ex.name)}${modeBadge} <span class="tiny">(${ex.type === "cardio" ? "Cardio" : "Strength"})</span></button>
 								<button class="btn" data-add-set="${ex.exerciseId}">+ Set</button>
+								<button class="btn ghost" data-repeat-set="${ex.exerciseId}">Same as Prev</button>
 							</div>
 							<div class="tiny exercise-meta">${escapeHtml(lastWeekText)}</div>
-							<div class="insight">${cmp ? renderInsight(cmp) : "No previous session comparison yet."}</div>
 							<div class="intensity-row">
 								<select class="input" data-intensity-mode="${ex.exerciseId}">
 									<option value="normal" ${(ex.intensityMode || "normal") === "normal" ? "selected" : ""}>Normal</option>
@@ -2167,7 +2377,6 @@
 								</select>
 								${modeDetailInput}
 							</div>
-							${plateau ? `<div class="plateau-pill">${escapeHtml(plateau)}</div>` : ""}
 							${ex.type === "cardio"
 								? `${cardioSets.map((set, i) => {
 									const sec = Number(set.durationSec) || 0;
@@ -2210,7 +2419,7 @@
 						<div class="set-index">#${index + 1}</div>
 						<button class="btn bodyweight-btn ${set.bodyweight ? "active" : ""}" title="Toggle bodyweight" data-toggle-bodyweight="${exerciseId}" data-idx="${index}">${set.bodyweight ? "BW" : "KG"}</button>
 							${set.bodyweight
-								? `<input class="input" type="number" min="0" step="0.1" placeholder="Bodyweight" data-set-input="bodyweightWeight" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.bodyweightWeight)}" />`
+								? `<input class="input" type="number" min="0" step="0.1" placeholder="Added weight (optional)" data-set-input="bodyweightWeight" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.bodyweightWeight)}" />`
 								: `<input class="input" type="number" min="0" step="0.5" placeholder="Weight" data-set-input="weight" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.weight)}" />`}
 						<input class="input" type="number" min="0" step="1" placeholder="Reps" data-set-input="reps" data-ex="${exerciseId}" data-idx="${index}" value="${safeNum(set.reps)}" />
 						<button class="icon-btn" title="Remove set" data-remove-set="${exerciseId}" data-idx="${index}">×</button>
@@ -2252,8 +2461,64 @@
 				`;
 			}
 
+			function renderExercises() {
+				const catalog = getExerciseCatalog();
+				const selected = state.selectedLibraryExercise && catalog.some((ex) => ex.id === state.selectedLibraryExercise)
+					? state.selectedLibraryExercise
+					: (catalog[0] && catalog[0].id) || "";
+				state.selectedLibraryExercise = selected;
+				const selectedExercise = catalog.find((ex) => ex.id === selected) || null;
+
+				return `
+					<div class="section-kicker">Exercise Library</div>
+					<div class="card card-planner">
+						<h3 style="margin:0 0 10px;">Add Canonical Exercise</h3>
+						<div class="row wrap">
+							<input class="input grow" id="libraryNewName" placeholder="e.g. Deadlift" />
+							<select class="input" style="max-width:160px;" id="libraryNewType">
+								${EXERCISE_TYPES.map((t) => `<option value="${t}">${capitalizeWord(t)}</option>`).join("")}
+							</select>
+							<button class="btn primary" id="addLibraryExerciseBtn">Add to Library</button>
+						</div>
+						<p class="small" style="margin:8px 0 0;">Add every exercise you want to standardize here first. Splits will only let you choose from this list.</p>
+					</div>
+
+					<div class="card card-splits-list">
+						<h3 style="margin:0 0 10px;">Library Entries</h3>
+						<div class="row wrap" style="margin-bottom:10px;">
+							<select class="input grow" id="libraryExerciseSelect">
+								${catalog.length ? catalog.map((ex) => `<option value="${ex.id}" ${ex.id === selected ? "selected" : ""}>${escapeHtml(ex.name)} (${capitalizeWord(ex.type)})</option>`).join("") : `<option value="">No exercises yet</option>`}
+							</select>
+						</div>
+						${catalog.length ? catalog.map((ex) => {
+							const usedIn = listLibraryUsageSources(ex.id).slice(0, 6);
+							return `
+								<div class="split-item" data-library-exercise="${ex.id}">
+									<div class="row wrap">
+										<input class="input grow" value="${escapeHtml(ex.name)}" data-library-name="${ex.id}" />
+										<select class="input" style="max-width:160px;" data-library-type="${ex.id}">${EXERCISE_TYPES.map((t) => `<option value="${t}" ${ex.type === t ? "selected" : ""}>${capitalizeWord(t)}</option>`).join("")}</select>
+										<button class="btn success" data-library-save="${ex.id}">Save</button>
+										<button class="btn danger" data-library-delete="${ex.id}">Delete</button>
+									</div>
+									<p class="small" style="margin:8px 0 0;">Used in: ${usedIn.length ? usedIn.map(escapeHtml).join(", ") : "No splits or workouts yet"}</p>
+								</div>
+							`;
+						}).join("") : `<p class="small" style="margin:0;">No exercises in the library yet.</p>`}
+					</div>
+
+					<div class="card">
+						<h3 style="margin:0 0 10px;">Focused Exercise</h3>
+						${selectedExercise ? `
+							<p class="small" style="margin:0 0 6px;"><strong>${escapeHtml(selectedExercise.name)}</strong> (${capitalizeWord(selectedExercise.type)})</p>
+							<p class="small" style="margin:0 0 6px;">This is the canonical entry that splits will use.</p>
+							<p class="tiny" style="margin:0;">Renaming it updates all linked split entries and workout logs that reference the same exercise ID.</p>
+						` : `<p class="small" style="margin:0;">Select an exercise to inspect it.</p>`}
+					</div>
+				`;
+			}
+
 			function renderSplitCard(split) {
-				const recommendations = getExerciseRecommendationsForSplit(split.id);
+				const search = state.librarySearches[split.id] || "";
 				return `
 					<div class="split-item" data-split="${split.id}">
 						<div class="row wrap">
@@ -2264,23 +2529,21 @@
 						<div style="margin-top:8px;">
 							${(split.exercises || []).map((ex, idx) => `
 								<div class="split-ex">
-									<input class="input grow" data-edit-ex-name="${split.id}" data-ex-id="${ex.id}" value="${escapeHtml(ex.name)}" />
-									<select class="input" style="max-width:120px;" data-edit-ex-type="${split.id}" data-ex-id="${ex.id}">${EXERCISE_TYPES.map((t) => `<option value="${t}" ${ex.type === t ? "selected" : ""}>${t}</option>`).join("")}</select>
+									<div class="input grow" style="display:flex;align-items:center;">${idx + 1}. ${escapeHtml(ex.name)} <span class="tiny" style="margin-left:8px;">(${capitalizeWord(ex.type)})</span></div>
 									<button class="btn" data-move-ex="up" data-split-id="${split.id}" data-ex-id="${ex.id}" ${idx === 0 ? "disabled" : ""}>↑</button>
 									<button class="btn" data-move-ex="down" data-split-id="${split.id}" data-ex-id="${ex.id}" ${idx === split.exercises.length - 1 ? "disabled" : ""}>↓</button>
 									<button class="btn danger" data-del-ex="${split.id}" data-ex-id="${ex.id}">×</button>
 								</div>
 							`).join("")}
 						</div>
-						<div class="row" style="margin-top:10px;">
-							<input class="input grow" placeholder="Add exercise" data-new-ex-input="${split.id}" />
-							<select class="input" style="max-width:120px;" data-new-ex-type="${split.id}">${EXERCISE_TYPES.map((t) => `<option value="${t}">${t}</option>`).join("")}</select>
-							<button class="btn accent" data-add-ex="${split.id}">Add</button>
+						<div class="row wrap" style="margin-top:10px; align-items:flex-start;">
+							<div class="combo-wrap">
+								<input class="input" placeholder="Search and select from library" data-library-combo="${split.id}" value="${escapeHtml(search)}" autocomplete="off" />
+								<div class="combo-menu" data-library-menu="${split.id}" style="display:none;">${renderSplitLibrarySuggestions(split.id, search)}</div>
+							</div>
+							<button class="btn accent" data-add-ex="${split.id}">Add to Split</button>
 						</div>
-						<div class="tiny" style="margin-top:10px;">Recommendations from your previous exercises</div>
-						<div class="row wrap" style="margin-top:6px;">
-							${recommendations.length ? recommendations.map((ex) => `<button class="btn ghost" style="min-height:34px;padding:0 10px;font-size:.8rem;" data-pick-exercise="${split.id}" data-pick-ex-name="${escapeHtml(ex.name)}" data-pick-ex-type="${ex.type}">${escapeHtml(ex.name)} <span class="tiny">(${capitalizeWord(ex.type)})</span></button>`).join("") : `<span class="small">Add a few exercises first and they will appear here.</span>`}
-						</div>
+						<div class="tiny" style="margin-top:8px;">Type to filter instantly, then pick from the dropdown suggestions.</div>
 					</div>
 				`;
 			}
@@ -2440,6 +2703,7 @@
 
 				if (state.view === "today") bindTodayEvents(root);
 				if (state.view === "splits") bindSplitsEvents(root);
+				if (state.view === "exercises") bindExercisesEvents(root);
 				if (state.view === "calendar") bindCalendarEvents(root);
 				if (state.view === "history") bindHistoryEvents(root);
 				if (state.view === "settings") bindSettingsEvents(root);
@@ -2513,6 +2777,30 @@
 					};
 				});
 
+				root.querySelectorAll("[data-repeat-set]").forEach((btn) => {
+					btn.onclick = () => {
+						const exId = btn.dataset.repeatSet;
+						const ex = workout.exercises.find((x) => x.exerciseId === exId);
+						if (!ex) return;
+						if (!Array.isArray(ex.sets)) ex.sets = [];
+						if (!ex.sets.length) {
+							ex.sets.push(ex.type === "cardio" ? { durationSec: 0, distanceKm: "" } : makeEmptyStrengthSet(ex.intensityMode || "normal"));
+							toast("Added first set");
+							autosave();
+							render();
+							return;
+						}
+						const last = ex.sets[ex.sets.length - 1] || {};
+						if (ex.type === "cardio") {
+							ex.sets.push({ durationSec: Number(last.durationSec) || 0, distanceKm: normalizeNum(last.distanceKm) });
+						} else {
+							ex.sets.push(normalizeStrengthSetByMode(last, ex.intensityMode || "normal"));
+						}
+						autosave();
+						render();
+					};
+				});
+
 				root.querySelectorAll("[data-remove-set]").forEach((btn) => {
 					btn.onclick = () => {
 						const exId = btn.dataset.removeSet;
@@ -2544,10 +2832,18 @@
 						const idx = Number(btn.dataset.idx);
 						const ex = workout.exercises.find((x) => x.exerciseId === exId);
 						if (!ex || !ex.sets || !ex.sets[idx]) return;
-						ex.sets[idx].bodyweight = !ex.sets[idx].bodyweight;
-						if (ex.sets[idx].bodyweight) {
-							ex.sets[idx].weight = "";
-								ex.sets[idx].bodyweightWeight = ex.sets[idx].bodyweightWeight || "";
+						const set = ex.sets[idx];
+						set.bodyweight = !set.bodyweight;
+						if (set.bodyweight) {
+							if ((normalizeNum(set.bodyweightWeight) === "" || set.bodyweightWeight === undefined) && normalizeNum(set.weight) !== "") {
+								set.bodyweightWeight = normalizeNum(set.weight);
+							}
+							set.weight = "";
+							set.bodyweightWeight = set.bodyweightWeight || "";
+						} else {
+							if (normalizeNum(set.weight) === "" && normalizeNum(set.bodyweightWeight) !== "") {
+								set.weight = normalizeNum(set.bodyweightWeight);
+							}
 						}
 						autosave();
 						render();
@@ -2720,66 +3016,65 @@
 				root.querySelectorAll("[data-add-ex]").forEach((btn) => {
 					btn.onclick = () => {
 						const split = getSplitById(btn.dataset.addEx);
-						const inp = root.querySelector(`[data-new-ex-input='${btn.dataset.addEx}']`);
-						const typeSel = root.querySelector(`[data-new-ex-type='${btn.dataset.addEx}']`);
-						if (!split || !inp) return;
-						const name = (inp.value || "").trim();
-						if (!name) return toast("Enter exercise name");
-						const type = typeSel && EXERCISE_TYPES.includes(typeSel.value) ? typeSel.value : "strength";
-						if (split.exercises.some((ex) => exerciseKey(ex.name, ex.type) === exerciseKey(name, type))) {
+						const splitId = btn.dataset.addEx;
+						const input = root.querySelector(`[data-library-combo='${splitId}']`);
+						if (!split || !input) return;
+						const query = (input.value || "").trim();
+						let libraryEntry = getLibraryExerciseById(state.librarySelections[splitId]);
+						if (!libraryEntry && query) {
+							const exact = getFilteredLibraryExercises(query, splitId).find((ex) => normalizeExerciseName(ex.name) === normalizeExerciseName(query) || normalizeExerciseName(formatLibraryOptionLabel(ex)) === normalizeExerciseName(query));
+							if (exact) libraryEntry = getLibraryExerciseById(exact.id);
+						}
+						if (!libraryEntry) return toast("Type and choose an exercise from suggestions");
+						if (split.exercises.some((ex) => ex.id === libraryEntry.id)) {
 							return toast("That exercise is already in this split");
 						}
-						split.exercises.push({ id: getSharedExerciseId(name, type) || uid("ex"), name, type });
-						inp.value = "";
+						split.exercises.push({ id: libraryEntry.id, name: libraryEntry.name, type: libraryEntry.type });
+						state.librarySearches[splitId] = "";
+						state.librarySelections[splitId] = "";
 						saveSplitChanges(split.id);
 						autosave();
+						toast(`Added ${libraryEntry.name}`);
 						render();
 					};
 				});
 
-				root.querySelectorAll("[data-pick-exercise]").forEach((btn) => {
-					btn.onclick = () => {
-						const split = getSplitById(btn.dataset.pickExercise);
-						if (!split) return;
-						const name = String(btn.dataset.pickExName || "").trim();
-						const type = normalizeExerciseType(btn.dataset.pickExType);
-						if (!name) return;
-						if (split.exercises.some((ex) => exerciseKey(ex.name, ex.type) === exerciseKey(name, type))) {
-							return toast("That exercise is already in this split");
-						}
-						split.exercises.push({ id: getSharedExerciseId(name, type) || uid("ex"), name, type });
-						saveSplitChanges(split.id);
-						autosave();
-						toast(`Added ${name}`);
-						render();
+				root.querySelectorAll("[data-library-combo]").forEach((inp) => {
+					inp.onfocus = () => {
+						const splitId = inp.dataset.libraryCombo;
+						const query = inp.value || "";
+						state.librarySearches[splitId] = query;
+						state.librarySelections[splitId] = "";
+						updateSplitLibrarySuggestionMenu(root, splitId, query, true);
+					};
+					inp.oninput = () => {
+						const splitId = inp.dataset.libraryCombo;
+						const query = inp.value || "";
+						state.librarySearches[splitId] = query;
+						state.librarySelections[splitId] = "";
+						updateSplitLibrarySuggestionMenu(root, splitId, query, true);
+					};
+					inp.onblur = () => {
+						const splitId = inp.dataset.libraryCombo;
+						setTimeout(() => updateSplitLibrarySuggestionMenu(root, splitId, inp.value || "", false), 120);
 					};
 				});
 
-				root.querySelectorAll("[data-edit-ex-name]").forEach((inp) => {
-					inp.onchange = () => {
-						const split = getSplitById(inp.dataset.editExName);
-						if (!split) return;
-						const ex = split.exercises.find((e) => e.id === inp.dataset.exId);
-						if (!ex) return;
-						const next = (inp.value || "").trim();
-						if (!next) return render();
-						ex.name = next;
-						saveSplitChanges(split.id);
-						autosave();
-						render();
+				root.querySelectorAll("[data-library-menu]").forEach((menu) => {
+					menu.onmousedown = (e) => {
+						e.preventDefault();
 					};
-				});
-
-				root.querySelectorAll("[data-edit-ex-type]").forEach((sel) => {
-					sel.onchange = () => {
-						const split = getSplitById(sel.dataset.editExType);
-						if (!split) return;
-						const ex = split.exercises.find((e) => e.id === sel.dataset.exId);
-						if (!ex) return;
-						ex.type = EXERCISE_TYPES.includes(sel.value) ? sel.value : "strength";
-						saveSplitChanges(split.id);
-						autosave();
-						render();
+					menu.onclick = (e) => {
+						const btn = e.target.closest("[data-library-pick]");
+						if (!btn) return;
+						const splitId = btn.dataset.libraryPick;
+						const ex = getLibraryExerciseById(btn.dataset.exId);
+						const input = root.querySelector(`[data-library-combo='${splitId}']`);
+						if (!ex || !input) return;
+						state.librarySelections[splitId] = ex.id;
+						state.librarySearches[splitId] = formatLibraryOptionLabel(ex);
+						input.value = formatLibraryOptionLabel(ex);
+						updateSplitLibrarySuggestionMenu(root, splitId, input.value, false);
 					};
 				});
 
@@ -2808,6 +3103,78 @@
 						split.exercises[j] = tmp;
 						saveSplitChanges(split.id);
 						autosave();
+						render();
+					};
+				});
+			}
+
+			function updateSplitLibrarySuggestionMenu(root, splitId, query, open) {
+				const menu = root.querySelector(`[data-library-menu='${splitId}']`);
+				if (!menu) return;
+				menu.innerHTML = renderSplitLibrarySuggestions(splitId, query);
+				menu.style.display = open ? "block" : "none";
+			}
+
+			function bindExercisesEvents(root) {
+				const addBtn = root.querySelector("#addLibraryExerciseBtn");
+				if (addBtn) {
+					addBtn.onclick = () => {
+						const nameInput = root.querySelector("#libraryNewName");
+						const typeSelect = root.querySelector("#libraryNewType");
+						const name = (nameInput.value || "").trim();
+						if (!name) return toast("Enter an exercise name");
+						const entry = createLibraryExercise(name, typeSelect ? typeSelect.value : "strength");
+						if (!entry) return toast("That exercise already exists");
+						nameInput.value = "";
+						state.selectedLibraryExercise = entry.id;
+						toast("Exercise added to library");
+						render();
+					};
+				}
+
+				const librarySelect = root.querySelector("#libraryExerciseSelect");
+				if (librarySelect) {
+					librarySelect.onchange = () => {
+						state.selectedLibraryExercise = librarySelect.value || null;
+						render();
+					};
+				}
+
+				root.querySelectorAll("[data-library-save]").forEach((btn) => {
+					btn.onclick = () => {
+						const exId = btn.dataset.librarySave;
+						const nameInput = root.querySelector(`[data-library-name='${exId}']`);
+						const typeSelect = root.querySelector(`[data-library-type='${exId}']`);
+						if (!nameInput || !typeSelect) return;
+						const nextName = (nameInput.value || "").trim();
+						if (!nextName) return toast("Exercise name cannot be empty");
+						updateLibraryExercise(exId, nextName, typeSelect.value);
+						state.selectedLibraryExercise = exId;
+						toast("Library exercise saved");
+						render();
+					};
+				});
+
+				root.querySelectorAll("[data-library-name]").forEach((inp) => {
+					inp.onkeydown = (e) => {
+						if (e.key !== "Enter") return;
+						e.preventDefault();
+						const btn = root.querySelector(`[data-library-save='${inp.dataset.libraryName}']`);
+						if (btn) btn.click();
+					};
+				});
+
+				root.querySelectorAll("[data-library-delete]").forEach((btn) => {
+					btn.onclick = () => {
+						const exId = btn.dataset.libraryDelete;
+						const entry = getLibraryExerciseById(exId);
+						if (!entry) return;
+						const usage = getExerciseUsageMap().get(exId) || { total: 0 };
+						if (usage.total > 0) return toast("Remove it from splits and workouts first");
+						if (!confirm(`Delete ${entry.name} from the library?`)) return;
+						if (!deleteLibraryExercise(exId)) return toast("Could not delete exercise");
+						if (state.selectedLibraryExercise === exId) state.selectedLibraryExercise = null;
+						toast("Exercise removed from library");
 						render();
 					};
 				});
@@ -3117,13 +3484,97 @@
 				return state.data.splits.find((s) => s.id === id) || null;
 			}
 
+			function getLibraryExerciseById(id) {
+				return (state.data.exerciseLibrary || []).find((ex) => ex.id === id) || null;
+			}
+
+			function createLibraryExercise(name, type) {
+				const nextName = String(name || "").trim();
+				if (!nextName) return null;
+				const nextType = normalizeExerciseType(type);
+				const existing = (state.data.exerciseLibrary || []).find((ex) => exerciseKey(ex.name, ex.type) === exerciseKey(nextName, nextType));
+				if (existing) return null;
+				const entry = {
+					id: uid("ex"),
+					name: nextName,
+					type: nextType,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString()
+				};
+				state.data.exerciseLibrary.push(entry);
+				autosave();
+				return entry;
+			}
+
+			function updateLibraryExercise(exerciseId, nextName, nextType) {
+				const entry = getLibraryExerciseById(exerciseId);
+				if (!entry) return null;
+				const name = nextName === null || nextName === undefined ? entry.name : String(nextName || "").trim();
+				const type = nextType === null || nextType === undefined || nextType === "" ? entry.type : normalizeExerciseType(nextType);
+				if (!name) return null;
+				const conflict = (state.data.exerciseLibrary || []).find((ex) => ex.id !== exerciseId && exerciseKey(ex.name, ex.type) === exerciseKey(name, type));
+				if (conflict) {
+					mergeExerciseReferences(exerciseId, conflict.id, conflict.name, conflict.type);
+					state.data.exerciseLibrary = (state.data.exerciseLibrary || []).filter((ex) => ex.id !== exerciseId);
+					autosave();
+					return conflict;
+				}
+				entry.name = name;
+				entry.type = type;
+				entry.updatedAt = new Date().toISOString();
+				syncExerciseReferences(exerciseId, name, type);
+				autosave();
+				return entry;
+			}
+
+			function deleteLibraryExercise(exerciseId) {
+				const entry = getLibraryExerciseById(exerciseId);
+				if (!entry) return false;
+				const usage = getExerciseUsageMap().get(exerciseId) || { total: 0 };
+				if (usage.total > 0) return false;
+				state.data.exerciseLibrary = (state.data.exerciseLibrary || []).filter((ex) => ex.id !== exerciseId);
+				autosave();
+				return true;
+			}
+
+			function syncExerciseReferences(exerciseId, nextName, nextType) {
+				(state.data.splits || []).forEach((split) => {
+					(split.exercises || []).forEach((ex) => {
+						if (ex.id !== exerciseId) return;
+						ex.name = nextName;
+						ex.type = nextType;
+					});
+				});
+				Object.values(state.data.workouts || {}).forEach((workout) => {
+					(workout.exercises || []).forEach((ex) => {
+						if (ex.exerciseId !== exerciseId) return;
+						ex.name = nextName;
+						ex.type = nextType;
+					});
+				});
+			}
+
+			function mergeExerciseReferences(fromExerciseId, toExerciseId, nextName, nextType) {
+				(state.data.splits || []).forEach((split) => {
+					(split.exercises || []).forEach((ex) => {
+						if (ex.id !== fromExerciseId) return;
+						ex.id = toExerciseId;
+						ex.name = nextName;
+						ex.type = nextType;
+					});
+				});
+				Object.values(state.data.workouts || {}).forEach((workout) => {
+					(workout.exercises || []).forEach((ex) => {
+						if (ex.exerciseId !== fromExerciseId) return;
+						ex.exerciseId = toExerciseId;
+						ex.name = nextName;
+						ex.type = nextType;
+					});
+				});
+			}
+
 			function listAllExercises() {
-				const map = new Map();
-				state.data.splits.forEach((s) => s.exercises.forEach((e) => map.set(e.id, { name: e.name, type: e.type || "strength" })));
-				Object.values(state.data.workouts).forEach((w) => (w.exercises || []).forEach((e) => {
-					if (!map.has(e.exerciseId)) map.set(e.exerciseId, { name: e.name, type: e.type || "strength" });
-				}));
-				return Array.from(map.entries()).map(([id, value]) => ({ id, name: value.name, type: value.type }));
+				return (state.data.exerciseLibrary || []).map((ex) => ({ id: ex.id, name: ex.name, type: ex.type || "strength" }));
 			}
 
 			function getExerciseSessions(exerciseId) {
@@ -3160,18 +3611,26 @@
 				};
 			}
 
+			function getPreviousExerciseSession(exerciseId, currentDate) {
+				const prev = getExerciseSessions(exerciseId)
+					.filter((s) => s.date < currentDate)
+					.slice(-1)[0];
+				return prev || null;
+			}
+
 			function openHistoryModal(exerciseId) {
 				const all = getExerciseSessions(exerciseId);
 				const recent = all.slice(-5).reverse();
 				const exName = (listAllExercises().find((x) => x.id === exerciseId) || {}).name || "Exercise";
 				const exact = getExactLastWeekSets(exerciseId, state.selectedDate);
+				const prev = getPreviousExerciseSession(exerciseId, state.selectedDate);
 
 				$("modalTitle").textContent = exName + " • History";
 				$("lastWeekExact").textContent = exact
-					? exact.type === "cardio"
-						? `Exact last week (${fmtDisplayDate(exact.date)}): ${exact.sets.map((s, i) => `Set ${i + 1}: ${formatDuration(Number(s.durationSec) || 0)}${safeNum(s.distanceKm) ? ` • ${safeNum(s.distanceKm)} km` : ""}`).join(" | ")}`
-						: `Exact last week (${fmtDisplayDate(exact.date)}): ${exact.sets.map((s, i) => `Set ${i + 1}: ${s.weight} × ${s.reps}`).join(" | ")}`
-					: "No exact workout found from one week ago.";
+					? `Last week (${fmtDisplayDate(exact.date)}): ${exact.sets.map((s, i) => `Set ${i + 1}: ${formatSetForDisplay(s, exact.type, exact.intensityMode || "normal")}`).join(" | ")}`
+					: prev
+						? `Previous record (${fmtDisplayDate(prev.date)}): ${prev.sets.map((s, i) => `Set ${i + 1}: ${formatSetForDisplay(s, prev.type, prev.intensityMode || "normal")}`).join(" | ")}`
+						: "No previous record yet.";
 
 				$("historyList").innerHTML = recent.length
 					? recent.map((s) => `<div class="session-line"><strong>${fmtDisplayDate(s.date)}</strong> <span class="tiny">(${escapeHtml(s.splitName || "Workout")})</span><div class="small" style="margin-top:6px;">${s.sets.map((set, i) => `Set ${i + 1}: ${formatSetForDisplay(set, s.type, s.intensityMode || "normal")}`).join(" • ")}</div></div>`).join("")
@@ -3451,9 +3910,16 @@
 				return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 			}
 			function exerciseKey(name, type) {
-				const normalizedName = String(name || "").trim().toLowerCase();
+				const normalizedName = normalizeExerciseName(name);
 				if (!normalizedName) return "";
 				return `${normalizedName}::${normalizeExerciseType(type)}`;
+			}
+			function normalizeExerciseName(name) {
+				return String(name || "")
+					.trim()
+					.toLowerCase()
+					.replace(/[\u2019'`]/g, "")
+					.replace(/[^a-z0-9]+/g, "");
 			}
 			function normalizeExerciseType(type) {
 				return EXERCISE_TYPES.includes(type) ? type : "strength";
@@ -3539,7 +4005,8 @@
 					return `A ${a}${b !== "x" ? ` + B ${b}` : ""}`;
 				}
 				if (set.bodyweight) {
-					return `BW ${safeNum(set.bodyweightWeight)}x${safeNum(set.reps)}`;
+					const added = safeNum(set.bodyweightWeight);
+					return `${added ? `BW+${added}` : "BW"}x${safeNum(set.reps)}`;
 				}
 				return `${safeNum(set.weight)}x${safeNum(set.reps)}`;
 			}
