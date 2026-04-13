@@ -1779,6 +1779,7 @@
 			"use strict";
 
 			const STORAGE_KEY = "workoutTracker_v1";
+			const BACKUP_STORAGE_KEY = "workoutTracker_v1_backup";
 			const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 			const WEEK_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 			const EXERCISE_TYPES = ["strength", "cardio"];
@@ -1787,22 +1788,27 @@
 				view: "today",
 				selectedDate: todayISO(),
 				calendarCursor: monthStart(todayISO()),
-				analyticsExerciseId: "",
 				selectedExerciseHistory: null,
 				data: loadData()
 			};
 
 			ensureDataShape(state.data);
+			syncAllWorkoutsToSplits();
 			autosave();
 			render();
 
 			function loadData() {
 				try {
 					const raw = localStorage.getItem(STORAGE_KEY);
-					if (!raw) return defaultData();
-					const parsed = JSON.parse(raw);
-					if (!parsed || typeof parsed !== "object") return defaultData();
-					return parsed;
+					if (raw) {
+						const parsed = JSON.parse(raw);
+						if (parsed && typeof parsed === "object") return parsed;
+					}
+					const backup = localStorage.getItem(BACKUP_STORAGE_KEY);
+					if (!backup) return defaultData();
+					const parsedBackup = JSON.parse(backup);
+					if (!parsedBackup || typeof parsedBackup !== "object") return defaultData();
+					return parsedBackup;
 				} catch {
 					return defaultData();
 				}
@@ -1906,8 +1912,70 @@
 				});
 			}
 
+			function syncAllWorkoutsToSplits() {
+				Object.values(state.data.workouts).forEach((workout) => {
+					if (!workout || !workout.date) return;
+					const split = getSplitById(workout.splitId);
+					if (!split) {
+						const fallback = getDefaultSplitForDate(workout.date);
+						if (fallback && fallback.id) syncWorkoutExercisesToSplit(workout, fallback);
+						return;
+					}
+					if (workoutNeedsSplitSync(workout, split)) syncWorkoutExercisesToSplit(workout, split);
+				});
+			}
+
+			function getExerciseRecommendationsForSplit(splitId) {
+				const split = getSplitById(splitId);
+				const excluded = new Set((split && Array.isArray(split.exercises) ? split.exercises : []).map((ex) => exerciseKey(ex.name, ex.type)));
+				const catalog = new Map();
+
+				const add = (name, type, lastUsed) => {
+					const key = exerciseKey(name, type);
+					if (!key || excluded.has(key)) return;
+					const current = catalog.get(key) || { name: String(name || "").trim(), type: normalizeExerciseType(type), count: 0, lastUsed: "" };
+					current.count += 1;
+					if (lastUsed && lastUsed > current.lastUsed) current.lastUsed = lastUsed;
+					catalog.set(key, current);
+				};
+
+				(state.data.splits || []).forEach((s) => {
+					(s.exercises || []).forEach((ex) => add(ex.name, ex.type, s.updatedAt || s.createdAt || ""));
+				});
+
+				Object.values(state.data.workouts || {}).forEach((w) => {
+					(w.exercises || []).forEach((ex) => add(ex.name, ex.type, w.date || w.updatedAt || ""));
+				});
+
+				return Array.from(catalog.values())
+					.sort((a, b) => b.count - a.count || b.lastUsed.localeCompare(a.lastUsed) || a.name.localeCompare(b.name))
+					.slice(0, 8);
+			}
+
+			function getSharedExerciseId(name, type) {
+				const key = exerciseKey(name, type);
+				if (!key) return "";
+				for (const split of state.data.splits || []) {
+					for (const ex of split.exercises || []) {
+						if (exerciseKey(ex.name, ex.type) === key && ex.id) return ex.id;
+					}
+				}
+				for (const workout of Object.values(state.data.workouts || {})) {
+					for (const ex of workout.exercises || []) {
+						if (exerciseKey(ex.name, ex.type) === key && ex.exerciseId) return ex.exerciseId;
+					}
+				}
+				return "";
+			}
+
 			function autosave() {
-				localStorage.setItem(STORAGE_KEY, JSON.stringify(state.data));
+				try {
+					const payload = JSON.stringify(state.data);
+					localStorage.setItem(STORAGE_KEY, payload);
+					localStorage.setItem(BACKUP_STORAGE_KEY, payload);
+				} catch {
+					// Storage can be unavailable in some browser/file:// setups.
+				}
 			}
 
 			function render() {
@@ -1926,12 +1994,11 @@
 					<section class="screen ${state.view === "today" ? "active" : ""}" id="screen-today">${renderToday()}</section>
 					<section class="screen ${state.view === "splits" ? "active" : ""}" id="screen-splits">${renderSplits()}</section>
 					<section class="screen ${state.view === "calendar" ? "active" : ""}" id="screen-calendar">${renderCalendar()}</section>
-					<section class="screen ${state.view === "analytics" ? "active" : ""}" id="screen-analytics">${renderAnalytics()}</section>
+					<section class="screen ${state.view === "history" ? "active" : ""}" id="screen-history">${renderHistory()}</section>
 					<section class="screen ${state.view === "settings" ? "active" : ""}" id="screen-settings">${renderSettings()}</section>
 				`;
 
 				bindGlobalEvents();
-				if (state.view === "analytics") drawAnalyticsChart();
 			}
 
 			function renderTabs() {
@@ -1939,7 +2006,7 @@
 					["today", "Today"],
 					["splits", "Splits"],
 					["calendar", "Calendar"],
-					["analytics", "Analytics"],
+					["history", "History"],
 					["settings", "Data"]
 				];
 
@@ -1953,15 +2020,23 @@
 				const weekStart = getWeekStartISO(state.selectedDate);
 				const weekEnd = addDays(weekStart, 6);
 				const workout = getWorkoutOrDefault(state.selectedDate);
-				const split = getSplitById(workout.splitId) || state.data.splits[0] || null;
-				if (state.data.workouts[state.selectedDate] && split) ensureSelectedWorkoutMatchesSplit(state.selectedDate);
-				if (split && workout.exercises.length === 0) syncWorkoutExercisesToSplit(workout, split);
+				const savedState = hasLoggedWorkoutData(state.data.workouts[state.selectedDate]);
+				const savedSets = (state.data.workouts[state.selectedDate]?.exercises || []).reduce((total, ex) => total + ((ex.sets || []).length), 0);
+				let split = getSplitById(workout.splitId) || null;
+				if (!split) {
+					split = getDefaultSplitForDate(state.selectedDate);
+				}
+				if (split) {
+					if (workoutNeedsSplitSync(workout, split)) syncWorkoutExercisesToSplit(workout, split);
+					if (workout.exercises.length === 0) syncWorkoutExercisesToSplit(workout, split);
+				}
 
 				return `
 					${holiday ? `<div class="section-kicker">Status</div><div class="card card-busy-override"><p class="small" style="margin:0;"><strong>${escapeHtml(holiday.name)}</strong> is marked as a holiday.</p></div>` : ""}
 					${weekOverride ? `<div class="section-kicker">Status</div><div class="card card-busy-override"><p class="small" style="margin:0 0 10px;"><strong>Temporary week shift is active</strong> (${weekStart} to ${weekEnd}). This only affects this week; next week uses your normal planner.</p><button class="btn ghost" id="clearWeekShiftBtn">Revert This Week Shift</button></div>` : ""}
 					<div class="section-kicker">Session Setup</div>
 					<div class="card card-session">
+						<p class="small" style="margin:0 0 8px;">Status: ${savedState ? `<strong>Saved</strong>${savedSets ? ` (${savedSets} sets)` : ""}` : `<strong>Not saved yet</strong>`}</p>
 						<div class="row wrap">
 							<input class="input grow" type="date" id="workoutDate" value="${state.selectedDate}" />
 							<select id="splitSelect" class="grow input">${splitOptions}</select>
@@ -1989,6 +2064,60 @@
 					<div class="card card-notes">
 						<label class="small" for="workoutNotes">Workout Notes</label>
 						<textarea class="input" id="workoutNotes" placeholder="How did the session feel?">${escapeHtml(workout.notes || "")}</textarea>
+					</div>
+
+				`;
+			}
+
+				function renderHistory() {
+					return `
+						<div class="section-kicker">Exercise History</div>
+						<div class="card card-history">
+							<h3 style="margin:0 0 10px;">Exercise History</h3>
+							${renderExerciseHistoryPanel()}
+						</div>
+					`;
+				}
+
+			function renderExerciseHistoryPanel() {
+				const exercises = listAllExercises();
+				if (!exercises.length) {
+					return `<p class="small" style="margin:0;">Add an exercise to a split and save a workout before history will appear here.</p>`;
+				}
+
+				const selectedId = exercises.some((ex) => ex.id === state.selectedExerciseHistory)
+					? state.selectedExerciseHistory
+					: exercises[0].id;
+				state.selectedExerciseHistory = selectedId;
+
+				const selected = exercises.find((ex) => ex.id === selectedId) || exercises[0];
+				const sessions = getExerciseSessions(selected.id);
+				const stats = getExerciseStats(selected.id);
+				const totalSets = sessions.reduce((sum, session) => sum + (session.sets || []).length, 0);
+
+				return `
+					<div class="row wrap">
+						<select class="input grow" id="exerciseHistorySelect">
+							${exercises.map((ex) => `<option value="${ex.id}" ${ex.id === selected.id ? "selected" : ""}>${escapeHtml(ex.name)} (${capitalizeWord(ex.type)})</option>`).join("")}
+						</select>
+					</div>
+					<p class="tiny" style="margin:8px 0 0;">This list shows every saved session for the selected exercise, including the weight and reps you entered for each set.</p>
+					<p class="small" style="margin:10px 0 6px;">${sessions.length} session${sessions.length === 1 ? "" : "s"} • ${totalSets} saved set${totalSets === 1 ? "" : "s"}</p>
+					<p class="small" style="margin:0 0 10px;">Best weight: <strong>${stats.bestWeight}</strong> • Best reps: <strong>${stats.bestReps}</strong> • Best e1RM: <strong>${stats.bestE1RM}</strong></p>
+					<div style="max-height: 320px; overflow: auto; padding-right: 4px;">
+						${sessions.length ? sessions.slice().reverse().map((session) => formatExerciseHistorySession(session)).join("") : `<p class="small" style="margin:0;">No saved sessions for this exercise yet.</p>`}
+					</div>
+				`;
+			}
+
+			function formatExerciseHistorySession(session) {
+				return `
+					<div class="session-line">
+						<div class="row wrap">
+							<strong>${fmtDisplayDate(session.date)}</strong>
+							<span class="tiny">${escapeHtml(session.splitName || "Workout")}</span>
+						</div>
+						<div class="small" style="margin-top:6px;">${(session.sets || []).map((set, i) => `Set ${i + 1}: ${formatSetForDisplay(set, session.type, session.intensityMode || "normal")}`).join(" • ")}</div>
 					</div>
 				`;
 			}
@@ -2124,10 +2253,12 @@
 			}
 
 			function renderSplitCard(split) {
+				const recommendations = getExerciseRecommendationsForSplit(split.id);
 				return `
 					<div class="split-item" data-split="${split.id}">
 						<div class="row wrap">
 							<input class="input grow" value="${escapeHtml(split.name)}" data-edit-split-name="${split.id}" />
+							<button class="btn success" data-save-split="${split.id}">Save Split</button>
 							<button class="btn danger" data-delete-split="${split.id}">Delete</button>
 						</div>
 						<div style="margin-top:8px;">
@@ -2145,6 +2276,10 @@
 							<input class="input grow" placeholder="Add exercise" data-new-ex-input="${split.id}" />
 							<select class="input" style="max-width:120px;" data-new-ex-type="${split.id}">${EXERCISE_TYPES.map((t) => `<option value="${t}">${t}</option>`).join("")}</select>
 							<button class="btn accent" data-add-ex="${split.id}">Add</button>
+						</div>
+						<div class="tiny" style="margin-top:10px;">Recommendations from your previous exercises</div>
+						<div class="row wrap" style="margin-top:6px;">
+							${recommendations.length ? recommendations.map((ex) => `<button class="btn ghost" style="min-height:34px;padding:0 10px;font-size:.8rem;" data-pick-exercise="${split.id}" data-pick-ex-name="${escapeHtml(ex.name)}" data-pick-ex-type="${ex.type}">${escapeHtml(ex.name)} <span class="tiny">(${capitalizeWord(ex.type)})</span></button>`).join("") : `<span class="small">Add a few exercises first and they will appear here.</span>`}
 						</div>
 					</div>
 				`;
@@ -2186,14 +2321,33 @@
 						<h3 style="margin:0 0 8px;">Selected Day</h3>
 						${renderSelectedDaySummary()}
 					</div>
+
+					<div class="card">
+						<h3 style="margin:0 0 8px;">Saved Workouts This Month</h3>
+						${renderMonthWorkoutList(y, m)}
+					</div>
 				`;
+			}
+
+			function renderMonthWorkoutList(year, month) {
+				const prefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+				const workouts = Object.values(state.data.workouts)
+					.filter((w) => typeof w.date === "string" && w.date.startsWith(prefix) && hasLoggedWorkoutData(w))
+					.sort((a, b) => b.date.localeCompare(a.date));
+
+				if (!workouts.length) return `<p class="small" style="margin:0;">No saved workouts in this month.</p>`;
+
+				return workouts.map((w) => {
+					const sets = (w.exercises || []).reduce((total, ex) => total + (ex.sets || []).length, 0);
+					return `<button class="session-line" style="width:100%; text-align:left; cursor:pointer;" data-day="${w.date}"><strong>${fmtDisplayDate(w.date)}</strong><div class="tiny" style="margin-top:4px;">${escapeHtml(w.splitName || "Workout")} • ${sets} sets</div></button>`;
+				}).join("");
 			}
 
 			function makeDayCell(year, month, day, otherMonth) {
 				const date = new Date(year, month, day);
 				const iso = toISO(date);
 				const today = iso === todayISO();
-				const hasWorkout = !!state.data.workouts[iso];
+				const hasWorkout = hasLoggedWorkoutData(state.data.workouts[iso]);
 				const holiday = getHoliday(iso);
 				const isPast = iso < todayISO();
 				const missed = state.data.settings.showMissedDays && isPast && !hasWorkout && !holiday;
@@ -2211,40 +2365,6 @@
 					${w.cardio && w.cardio.enabled ? `<p class="small" style="margin:0 0 6px;">Cardio: ${formatDuration(w.cardio.durationSec || 0)}${safeNum(w.cardio.distanceKm) ? ` • ${safeNum(w.cardio.distanceKm)} km` : ""}</p>` : ""}
 					<p class="small" style="margin:0 0 10px;">${escapeHtml(w.notes || "No notes")}</p>
 					<button class="btn primary" id="editSelectedWorkoutBtn">Edit This Workout</button>
-				`;
-			}
-
-			function renderAnalytics() {
-				const exerciseOptions = listAllExercises().map((ex) => `<option value="${ex.id}">${escapeHtml(ex.name)}</option>`).join("");
-				if (!state.analyticsExerciseId) {
-					const first = listAllExercises()[0];
-					state.analyticsExerciseId = first ? first.id : "";
-				}
-				const metrics = calcMetrics();
-				const exStats = state.analyticsExerciseId ? getExerciseStats(state.analyticsExerciseId) : null;
-
-				return `
-					<div class="card">
-						<h3 style="margin:0 0 10px;">Overview</h3>
-						<div class="metrics">
-							<div class="metric"><h4>${metrics.totalWorkouts}</h4><p>Total Workouts</p></div>
-							<div class="metric"><h4>${metrics.weeklyWorkouts}</h4><p>Last 7 Days</p></div>
-							<div class="metric"><h4>${metrics.avgSets}</h4><p>Avg Sets / Workout</p></div>
-							<div class="metric"><h4>${calcDisciplineStats().consistency}%</h4><p>30-Day Consistency</p></div>
-						</div>
-					</div>
-
-					<div class="card">
-						<div class="row wrap">
-							<h3 style="margin:0;">Exercise Progress</h3>
-							<select class="input grow" id="analyticsExerciseSelect">${exerciseOptions}</select>
-						</div>
-						<div class="chart-wrap" style="margin-top:10px;">
-							<canvas id="progressChart" width="720" height="260"></canvas>
-						</div>
-						<p class="small" id="chartHint" style="margin:8px 0 0;"></p>
-						${exStats ? `<p class="small" style="margin:6px 0 0;">Best weight: <strong>${exStats.bestWeight}</strong> • Best reps: <strong>${exStats.bestReps}</strong> • Best e1RM: <strong>${exStats.bestE1RM}</strong></p>` : ""}
-					</div>
 				`;
 			}
 
@@ -2321,7 +2441,7 @@
 				if (state.view === "today") bindTodayEvents(root);
 				if (state.view === "splits") bindSplitsEvents(root);
 				if (state.view === "calendar") bindCalendarEvents(root);
-				if (state.view === "analytics") bindAnalyticsEvents(root);
+				if (state.view === "history") bindHistoryEvents(root);
 				if (state.view === "settings") bindSettingsEvents(root);
 
 				$("closeModal").onclick = closeHistoryModal;
@@ -2544,7 +2664,7 @@
 						const next = (inp.value || "").trim();
 						if (!next) return render();
 						split.name = next;
-						syncWorkoutsUsingSplitFromDate(split.id, todayISO());
+						saveSplitChanges(split.id);
 						autosave();
 						toast("Split renamed");
 						render();
@@ -2565,8 +2685,23 @@
 								row.schedule = row.schedule.map((id) => (id === splitId ? "" : id));
 							});
 						}
+						Object.values(state.data.workouts).forEach((workout) => {
+							if (!workout || workout.splitId !== splitId) return;
+							const fallback = getDefaultSplitForDate(workout.date);
+							syncWorkoutExercisesToSplit(workout, fallback);
+						});
 						autosave();
 						toast("Split deleted");
+						render();
+					};
+				});
+
+				root.querySelectorAll("[data-save-split]").forEach((btn) => {
+					btn.onclick = () => {
+						const split = getSplitById(btn.dataset.saveSplit);
+						if (!split) return;
+						saveSplitChanges(split.id);
+						toast("Split saved");
 						render();
 					};
 				});
@@ -2590,10 +2725,32 @@
 						if (!split || !inp) return;
 						const name = (inp.value || "").trim();
 						if (!name) return toast("Enter exercise name");
-						split.exercises.push({ id: uid("ex"), name, type: typeSel && EXERCISE_TYPES.includes(typeSel.value) ? typeSel.value : "strength" });
+						const type = typeSel && EXERCISE_TYPES.includes(typeSel.value) ? typeSel.value : "strength";
+						if (split.exercises.some((ex) => exerciseKey(ex.name, ex.type) === exerciseKey(name, type))) {
+							return toast("That exercise is already in this split");
+						}
+						split.exercises.push({ id: getSharedExerciseId(name, type) || uid("ex"), name, type });
 						inp.value = "";
-						syncWorkoutsUsingSplitFromDate(split.id, todayISO());
+						saveSplitChanges(split.id);
 						autosave();
+						render();
+					};
+				});
+
+				root.querySelectorAll("[data-pick-exercise]").forEach((btn) => {
+					btn.onclick = () => {
+						const split = getSplitById(btn.dataset.pickExercise);
+						if (!split) return;
+						const name = String(btn.dataset.pickExName || "").trim();
+						const type = normalizeExerciseType(btn.dataset.pickExType);
+						if (!name) return;
+						if (split.exercises.some((ex) => exerciseKey(ex.name, ex.type) === exerciseKey(name, type))) {
+							return toast("That exercise is already in this split");
+						}
+						split.exercises.push({ id: getSharedExerciseId(name, type) || uid("ex"), name, type });
+						saveSplitChanges(split.id);
+						autosave();
+						toast(`Added ${name}`);
 						render();
 					};
 				});
@@ -2607,7 +2764,7 @@
 						const next = (inp.value || "").trim();
 						if (!next) return render();
 						ex.name = next;
-						syncWorkoutsUsingSplitFromDate(split.id, todayISO());
+						saveSplitChanges(split.id);
 						autosave();
 						render();
 					};
@@ -2620,7 +2777,7 @@
 						const ex = split.exercises.find((e) => e.id === sel.dataset.exId);
 						if (!ex) return;
 						ex.type = EXERCISE_TYPES.includes(sel.value) ? sel.value : "strength";
-						syncWorkoutsUsingSplitFromDate(split.id, todayISO());
+						saveSplitChanges(split.id);
 						autosave();
 						render();
 					};
@@ -2631,7 +2788,7 @@
 						const split = getSplitById(btn.dataset.delEx);
 						if (!split) return;
 						split.exercises = split.exercises.filter((e) => e.id !== btn.dataset.exId);
-						syncWorkoutsUsingSplitFromDate(split.id, todayISO());
+						saveSplitChanges(split.id);
 						autosave();
 						render();
 					};
@@ -2649,11 +2806,21 @@
 						const tmp = split.exercises[i];
 						split.exercises[i] = split.exercises[j];
 						split.exercises[j] = tmp;
-						syncWorkoutsUsingSplitFromDate(split.id, todayISO());
+						saveSplitChanges(split.id);
 						autosave();
 						render();
 					};
 				});
+			}
+
+			function bindHistoryEvents(root) {
+				const historySelect = root.querySelector("#exerciseHistorySelect");
+				if (historySelect) {
+					historySelect.onchange = () => {
+						state.selectedExerciseHistory = historySelect.value;
+						render();
+					};
+				}
 			}
 
 			function bindCalendarEvents(root) {
@@ -2684,16 +2851,6 @@
 						render();
 					};
 				}
-			}
-
-			function bindAnalyticsEvents(root) {
-				const sel = root.querySelector("#analyticsExerciseSelect");
-				if (!sel) return;
-				sel.value = state.analyticsExerciseId;
-				sel.onchange = () => {
-					state.analyticsExerciseId = sel.value;
-					drawAnalyticsChart();
-				};
 			}
 
 			function bindSettingsEvents(root) {
@@ -2729,7 +2886,6 @@
 					state.data = defaultData();
 					state.selectedDate = todayISO();
 					state.calendarCursor = monthStart(state.selectedDate);
-					state.analyticsExerciseId = "";
 					autosave();
 					toast("All data cleared");
 					render();
@@ -2753,11 +2909,19 @@
 							.filter((s) => hasAnyLoggedStrengthValue(s, ex.intensityMode));
 					}
 				});
+				w.savedAt = new Date().toISOString();
 				w.updatedAt = new Date().toISOString();
 				autosave();
 				openWorkoutSummaryModal(w);
 				toast("Workout saved");
 				render();
+			}
+
+			function saveSplitChanges(splitId) {
+				const split = getSplitById(splitId);
+				if (!split) return;
+				syncWorkoutsUsingSplitFromDate(split.id, "0000-01-01");
+				autosave();
 			}
 
 			function autofillFromLastWeek() {
@@ -2940,7 +3104,7 @@
 				return false;
 			}
 
-			function syncWorkoutsUsingSplitFromDate(splitId, fromDateIso = todayISO()) {
+			function syncWorkoutsUsingSplitFromDate(splitId, fromDateIso = "0000-01-01") {
 				const split = getSplitById(splitId);
 				if (!split) return;
 				Object.values(state.data.workouts).forEach((w) => {
@@ -3022,10 +3186,10 @@
 
 			function calcMetrics() {
 				const workouts = Object.values(state.data.workouts).sort((a, b) => a.date.localeCompare(b.date));
-				const totalWorkouts = workouts.length;
+				const totalWorkouts = workouts.filter((w) => hasLoggedWorkoutData(w)).length;
 				const weekAgo = addDays(todayISO(), -6);
-				const weeklyWorkouts = workouts.filter((w) => w.date >= weekAgo && w.date <= todayISO()).length;
-				const totalSets = workouts.reduce((sum, w) => sum + (w.exercises || []).reduce((s, ex) => s + (ex.sets || []).length, 0), 0);
+				const weeklyWorkouts = workouts.filter((w) => w.date >= weekAgo && w.date <= todayISO() && hasLoggedWorkoutData(w)).length;
+				const totalSets = workouts.reduce((sum, w) => sum + (hasLoggedWorkoutData(w) ? (w.exercises || []).reduce((s, ex) => s + (ex.sets || []).length, 0) : 0), 0);
 				const avgSets = totalWorkouts ? (totalSets / totalWorkouts).toFixed(1) : "0.0";
 				return { totalWorkouts, weeklyWorkouts, avgSets };
 			}
@@ -3184,98 +3348,13 @@
 				return calcStatsFromSets(sessions.flatMap((s) => s.sets || []));
 			}
 
-			function drawAnalyticsChart() {
-				const canvas = $("progressChart");
-				const hint = $("chartHint");
-				if (!canvas || !hint) return;
-				const ctx = canvas.getContext("2d");
-				const ratio = Math.max(1, window.devicePixelRatio || 1);
-				const cssW = canvas.clientWidth;
-				const cssH = canvas.clientHeight;
-				canvas.width = Math.floor(cssW * ratio);
-				canvas.height = Math.floor(cssH * ratio);
-				ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-				ctx.clearRect(0, 0, cssW, cssH);
-
-				const exId = state.analyticsExerciseId;
-				const data = getExerciseSessions(exId).map((s) => {
-					const vals = s.sets.map((x) => Number(x.weight)).filter((n) => Number.isFinite(n));
-					const top = vals.length ? Math.max(...vals) : 0;
-					return { x: s.date, y: top };
-				}).filter((p) => p.y > 0);
-
-				if (!data.length) {
-					hint.textContent = "No chart data yet. Log weight for this exercise.";
-					drawNoData(ctx, cssW, cssH);
-					return;
-				}
-
-				const pad = { l: 36, r: 12, t: 18, b: 28 };
-				const minY = Math.min(...data.map((d) => d.y));
-				const maxY = Math.max(...data.map((d) => d.y));
-				const yRange = Math.max(1, maxY - minY);
-				const plotW = cssW - pad.l - pad.r;
-				const plotH = cssH - pad.t - pad.b;
-
-				ctx.strokeStyle = "#2a3f65";
-				ctx.lineWidth = 1;
-				ctx.beginPath();
-				ctx.moveTo(pad.l, pad.t);
-				ctx.lineTo(pad.l, cssH - pad.b);
-				ctx.lineTo(cssW - pad.r, cssH - pad.b);
-				ctx.stroke();
-
-				const points = data.map((d, i) => {
-					const x = pad.l + (plotW * (data.length === 1 ? 0.5 : i / (data.length - 1)));
-					const y = pad.t + (plotH * (1 - ((d.y - minY) / yRange)));
-					return { ...d, px: x, py: y };
-				});
-
-				ctx.strokeStyle = "#60a5fa";
-				ctx.lineWidth = 2.4;
-				ctx.beginPath();
-				points.forEach((p, i) => {
-					if (i === 0) ctx.moveTo(p.px, p.py);
-					else ctx.lineTo(p.px, p.py);
-				});
-				ctx.stroke();
-
-				points.forEach((p) => {
-					ctx.fillStyle = "#5eead4";
-					ctx.beginPath();
-					ctx.arc(p.px, p.py, 3.4, 0, Math.PI * 2);
-					ctx.fill();
-				});
-
-				ctx.fillStyle = "#9fb4d8";
-				ctx.font = "12px Inter, system-ui, sans-serif";
-				ctx.fillText(String(maxY), 4, pad.t + 2);
-				ctx.fillText(String(minY), 4, cssH - pad.b);
-
-				const first = data[0];
-				const last = data[data.length - 1];
-				const diff = (last.y - first.y).toFixed(1);
-				const arrow = Number(diff) >= 0 ? "▲" : "▼";
-				hint.textContent = `Top-set trend: ${first.y} → ${last.y} (${arrow} ${Math.abs(Number(diff))}) over ${data.length} session${data.length === 1 ? "" : "s"}.`;
-			}
-
-			function drawNoData(ctx, w, h) {
-				ctx.fillStyle = "#213253";
-				ctx.fillRect(0, 0, w, h);
-				ctx.fillStyle = "#8fa7ce";
-				ctx.font = "14px Inter, sans-serif";
-				ctx.textAlign = "center";
-				ctx.fillText("No Data", w / 2, h / 2);
-				ctx.textAlign = "left";
-			}
-
 			function calcStreak() {
 				const dates = Object.keys(state.data.workouts).sort();
 				if (!dates.length) return 0;
 				let streak = 0;
 				let cursor = todayISO();
-				while (state.data.workouts[cursor] || getHoliday(cursor)) {
-					if (state.data.workouts[cursor]) streak++;
+				while (hasLoggedWorkoutData(state.data.workouts[cursor]) || getHoliday(cursor)) {
+					if (hasLoggedWorkoutData(state.data.workouts[cursor])) streak++;
 					cursor = addDays(cursor, -1);
 				}
 				return streak;
@@ -3311,7 +3390,6 @@
 						autosave();
 						state.selectedDate = todayISO();
 						state.calendarCursor = monthStart(state.selectedDate);
-						state.analyticsExerciseId = "";
 						toast("Backup imported");
 						render();
 					} catch {
@@ -3358,6 +3436,12 @@
 				return (state.data.settings.holidays || []).find((h) => h.date === dateIso) || null;
 			}
 
+			function hasLoggedWorkoutData(workout) {
+				if (!workout || !Array.isArray(workout.exercises)) return false;
+				if (typeof workout.savedAt === "string" && workout.savedAt.trim()) return true;
+				return workout.exercises.some((ex) => Array.isArray(ex.sets) && ex.sets.some((set) => hasAnyLoggedStrengthValue(set, ex.intensityMode || "normal") || (ex.type === "cardio" && ((Number(set.durationSec) || 0) > 0 || normalizeNum(set.distanceKm) !== ""))));
+			}
+
 			function formatDuration(totalSec) {
 				const s = Math.max(0, Number(totalSec) || 0);
 				const h = Math.floor(s / 3600);
@@ -3365,6 +3449,19 @@
 				const sec = s % 60;
 				if (h > 0) return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 				return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+			}
+			function exerciseKey(name, type) {
+				const normalizedName = String(name || "").trim().toLowerCase();
+				if (!normalizedName) return "";
+				return `${normalizedName}::${normalizeExerciseType(type)}`;
+			}
+			function normalizeExerciseType(type) {
+				return EXERCISE_TYPES.includes(type) ? type : "strength";
+			}
+			function capitalizeWord(text) {
+				const value = String(text || "").trim();
+				if (!value) return "";
+				return value.charAt(0).toUpperCase() + value.slice(1);
 			}
 
 			function $(id) { return document.getElementById(id); }
